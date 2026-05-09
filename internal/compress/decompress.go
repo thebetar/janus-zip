@@ -7,60 +7,55 @@ import (
 	"strings"
 )
 
-func DecompressFile(inputPath, outputPath string) error {
-	// Read compressed file
-	compressedData, err := os.ReadFile(inputPath)
-
-	if err != nil {
-		return err
-	}
-
-	// Split header and compressed data
-	parts := strings.SplitN(string(compressedData), "\n\n", 2)
-
-	if len(parts) < 2 {
-		return fmt.Errorf("Invalid compressed file format")
-	}
-
-	headerData := []byte(parts[0])
-	compressedData = []byte(parts[1])
-
-	// First read encoding tree from file
-	var decodingTree map[uint64]string
-	decodingTree, err = ReadDecodingTreeFromFile(headerData)
-
-	if err != nil {
-		return err
-	}
-
-	// Decompress data using encoding tree
-	var decompressedData []byte
-
-	for _, byteValue := range compressedData {
-		character, exists := decodingTree[uint64(byteValue)]
-
-		if !exists {
-			return fmt.Errorf("Invalid compressed data: byte value %d not found in decoding tree", byteValue)
-		}
-
-		decompressedData = append(decompressedData, []byte(character)...)
-	}
-
-	// Write decompressed data to output file
-	err = os.WriteFile(outputPath, decompressedData, 0644)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
+// decodeNode is a trie node used to decode Huffman-encoded bits.
+type decodeNode struct {
+	char   byte
+	isLeaf bool
+	zero   *decodeNode // bit 0
+	one    *decodeNode // bit 1
 }
 
-func ReadDecodingTreeFromFile(headerData []byte) (map[uint64]string, error) {
-	// Read encoding tree from file
-	decodingTree := make(map[uint64]string)
+func DecompressFile(inputPath, outputPath string) error {
+	raw, err := os.ReadFile(inputPath)
+	if err != nil {
+		return err
+	}
 
-	// Parse encoding tree string
+	if len(raw) == 0 {
+		return os.WriteFile(outputPath, []byte{}, 0644)
+	}
+
+	// The header and body are separated by the first "\n\n"
+	parts := strings.SplitN(string(raw), "\n\n", 2)
+	if len(parts) < 2 {
+		return fmt.Errorf("invalid compressed file format")
+	}
+
+	codeMap, err := parseHeader([]byte(parts[0]))
+	if err != nil {
+		return err
+	}
+
+	body := []byte(parts[1])
+	if len(body) < 1 {
+		return fmt.Errorf("invalid compressed file: missing data")
+	}
+
+	padding := int(body[0])
+	packedData := body[1:]
+
+	root := buildDecodeTree(codeMap)
+	decompressed, err := decodeBits(packedData, padding, root)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(outputPath, decompressed, 0644)
+}
+
+// parseHeader reads the "byte_val:binary_code,..." header into a code map.
+func parseHeader(headerData []byte) (map[byte]string, error) {
+	codeMap := make(map[byte]string)
 	pairs := strings.Split(string(headerData), ",")
 
 	for _, pair := range pairs {
@@ -68,22 +63,83 @@ func ReadDecodingTreeFromFile(headerData []byte) (map[uint64]string, error) {
 			continue
 		}
 
-		keyValue := strings.SplitN(pair, ":", 2)
+		kv := strings.SplitN(pair, ":", 2)
 
-		if len(keyValue) != 2 {
-			return nil, fmt.Errorf("Invalid encoding tree format")
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid header format")
 		}
 
-		character := keyValue[0]
-		idx, err := strconv.ParseUint(keyValue[1], 10, 64)
+		charVal, err := strconv.Atoi(kv[0])
 
-		if err != nil {
-			return nil, fmt.Errorf("Invalid encoding tree format: %v", err)
+		if err != nil || charVal < 0 || charVal > 255 {
+			return nil, fmt.Errorf("invalid header: bad byte value %q", kv[0])
 		}
 
-		decodingTree[idx] = character
+		codeMap[byte(charVal)] = kv[1]
 	}
 
-	return decodingTree, nil
+	return codeMap, nil
+}
+
+// buildDecodeTree constructs a binary trie from the Huffman code map.
+func buildDecodeTree(codeMap map[byte]string) *decodeNode {
+	root := &decodeNode{}
+	for char, code := range codeMap {
+		node := root
+
+		for _, bit := range code {
+			if bit == '0' {
+				if node.zero == nil {
+					node.zero = &decodeNode{}
+				}
+
+				node = node.zero
+			} else {
+				if node.one == nil {
+					node.one = &decodeNode{}
+				}
+
+				node = node.one
+			}
+		}
+
+		node.isLeaf = true
+		node.char = char
+	}
+
+	return root
+}
+
+// decodeBits walks the decode trie bit-by-bit (MSB first) and returns the
+// original bytes. The last `padding` bits of the final byte are ignored.
+func decodeBits(data []byte, padding int, root *decodeNode) ([]byte, error) {
+	var result []byte
+	node := root
+	totalBits := len(data)*8 - padding
+
+	for byteIdx, b := range data {
+		for bitPos := 7; bitPos >= 0; bitPos-- {
+			if byteIdx * 8 + (7 - bitPos) >= totalBits {
+				break
+			}
+
+			if (b >> uint(bitPos)) & 1 == 0 {
+				node = node.zero
+			} else {
+				node = node.one
+			}
+
+			if node == nil {
+				return nil, fmt.Errorf("invalid compressed data: unexpected bit sequence")
+			}
+
+			if node.isLeaf {
+				result = append(result, node.char)
+				node = root
+			}
+		}
+	}
+
+	return result, nil
 }
 
